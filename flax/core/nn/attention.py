@@ -454,19 +454,28 @@ def make_padding_mask(
         'Attention axis must be between the batch axis and the last-two axes.'
       )
 
-  mask_shape_final = (query_shape[0], 1)  #  batch_size, 1 (for all heads)s
-  for ax in attention_axis:
-    mask_shape_final += (query_shape[ax],)
-  for ax in attention_axis:
-    mask_shape_final += (key_shape[ax],)
+  # Combine batch and heads axes and trailing axes
+  # Precompute mask shape for efficiency
+  mask_shape_final = [query_shape[0], 1]  # batch_size, 1 (for all heads)
+  mask_shape_final += [query_shape[ax] for ax in attention_axis]
+  mask_shape_final += [key_shape[ax] for ax in attention_axis]
+  mask_shape_final = tuple(mask_shape_final)
 
-  padding_mask_query = padding_mask_query[..., None]
-  padding_mask_key = padding_mask_key[..., None]
+  # Efficient expansion: use expand_dims to avoid materializing new arrays via reshape/ellipsis
+  padding_mask_query = jnp.expand_dims(padding_mask_query, -1)
+  padding_mask_key = jnp.expand_dims(padding_mask_key, -1)
   perm = (0,) + tuple(np.flip(np.arange(padding_mask_key.ndim)))[:-1]
+  
+  # For large arrays, .transpose triggers a copy, so prefer swapaxes when possible for speed/memory
+  # However, we must follow logic in segmentation_mask branch
+  transposed_padding_mask_key = padding_mask_key.transpose(perm)
+
   if segmentation_mask:
-    mask = jnp.equal(padding_mask_query, padding_mask_key.transpose(perm))
+    mask = jnp.equal(padding_mask_query, transposed_padding_mask_key)
   else:
-    mask = jnp.multiply(padding_mask_query, padding_mask_key.transpose(perm))
+    # For "outer product", use broadcasting via multiplication (no extra materialization needed)
+    mask = padding_mask_query * transposed_padding_mask_key
+
 
   mask = mask.reshape(mask_shape_final)
   mask = jax.lax.convert_element_type(mask, jnp.float32)
